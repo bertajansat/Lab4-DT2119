@@ -8,6 +8,8 @@ import torch.utils.data as data
 import torch.optim as optim
 import numpy as np
 import argparse
+from lab4_proto import dataProcessing, train_audio_transform, test_audio_transform, levenshteinDistance
+from tqdm import tqdm
 
 '''
 HYPERPARAMETERS
@@ -21,8 +23,8 @@ hparams = {
 	"stride": 2,
 	"dropout": 0.1,
 	"learning_rate": 5e-4, 
-	"batch_size": 30, 
-	"epochs": 20
+	"batch_size": 128, 
+	"epochs": 10
 }
 
 
@@ -172,7 +174,7 @@ TRAINING AND TESTING
 def train(model, device, train_loader, criterion, optimizer, epoch):
 	model.train()
 	data_len = len(train_loader.dataset)
-	for batch_idx, _data in enumerate(train_loader):
+	for batch_idx, _data in enumerate(tqdm(train_loader)):
 		spectrograms, labels, input_lengths, label_lengths = _data 
 		spectrograms, labels = spectrograms.to(device), labels.to(device)
 
@@ -189,37 +191,39 @@ def train(model, device, train_loader, criterion, optimizer, epoch):
 				100. * batch_idx / len(train_loader), loss.item()))
 
 def test(model, device, test_loader, criterion, epoch):
-	print('\nevaluating…')
-	model.eval()
-	test_loss = 0
-	test_cer, test_wer = [], []
-	with torch.no_grad():
-		for I, _data in enumerate(test_loader):
-			spectrograms, labels, input_lengths, label_lengths = _data 
-			spectrograms, labels = spectrograms.to(device), labels.to(device)
+    print('\nevaluating…')
+    model.eval()
+    test_loss = 0
+    test_cer, test_wer = [], []
+    with torch.no_grad():
+        for I, _data in enumerate(test_loader):
+            spectrograms, labels, input_lengths, label_lengths = _data 
+            spectrograms, labels = spectrograms.to(device), labels.to(device)
 
 			# model output is (batch, time, n_class)
-			output = model(spectrograms)  
+            output = model(spectrograms)  
 			# transpose to (time, batch, n_class) in loss function
-			loss = criterion(output.transpose(0, 1), labels, input_lengths, label_lengths)
-			test_loss += loss.item() / len(test_loader)
+            loss = criterion(output.transpose(0, 1), labels, input_lengths, label_lengths)
+            test_loss += loss.item() / len(test_loader)
 
 			# get target text
-			decoded_targets = []
-			for i in range(len(labels)):
-				decoded_targets.append(intToText(labels[i][:label_lengths[i]].tolist()))
+            decoded_targets = []
+            for i in range(len(labels)):
+            	decoded_targets.append(intToText(labels[i][:label_lengths[i]].tolist()))
 
 			# get predicted text
-			decoded_preds = greedyDecoder(output)
+            decoded_preds = greedyDecoder(output)
 
 			# calculate accuracy
-			for j in range(len(decoded_preds)):
-				test_cer.append(cer(decoded_targets[j], decoded_preds[j]))
-				test_wer.append(wer(decoded_targets[j], decoded_preds[j]))
+            for j in range(len(decoded_preds)):
+            	test_cer.append(cer(decoded_targets[j], decoded_preds[j]))
+            	test_wer.append(wer(decoded_targets[j], decoded_preds[j]))
 
-	avg_cer = sum(test_cer)/len(test_cer)
-	avg_wer = sum(test_wer)/len(test_wer)
-	print('Test set: Average loss: {:.4f}, Average CER: {:4f} Average WER: {:.4f}\n'.format(test_loss, avg_cer, avg_wer))
+    avg_cer = sum(test_cer)/len(test_cer)
+    avg_wer = sum(test_wer)/len(test_wer)
+    print('Test set: Average loss: {:.4f}, Average CER: {:4f} Average WER: {:.4f}\n'.format(test_loss, avg_cer, avg_wer))
+    return avg_cer, avg_wer
+
 
 '''
 MAIN PROGRAM
@@ -281,13 +285,18 @@ if __name__ == '__main__':
 		model.load_state_dict(torch.load(args.model))
 
 	if args.mode == 'train':
-		for epoch in range(hparams['epochs']):
-			train(model, device, train_loader, criterion, optimizer, epoch)
-			test(model, device, val_loader, criterion, epoch)
-			torch.save(model.state_dict(),'checkpoints/epoch-{}.pt'.format(epoch))
+         cer_init = np.inf
+         wer_init = np.inf
+         for epoch in range(hparams['epochs']):
+            train(model, device, train_loader, criterion, optimizer, epoch)
+            cer,wer=test(model, device, val_loader, criterion, epoch)
+            if cer<cer_init or wer<wer_init:
+                torch.save(model.state_dict(),'checkpoints/epoch-{}.pt'.format(epoch))
+                cer_init=cer
+                wer_init = wer
 
 	elif args.mode == 'test':
-		test(model, device, test_loader, criterion, -1)
+		cer,wer=test(model, device, test_loader, criterion, -1)
 
 	elif args.mode == 'recognize':
 		for wavfile in args.wavfiles:
@@ -298,3 +307,12 @@ if __name__ == '__main__':
 			text = greedyDecoder(output)
 			print('wavfile:',wavfile)
 			print('text:',text)
+
+# MAIN CODE:
+
+import torchaudio
+
+# Import datasets
+train_dataset = torchaudio.datasets.LIBRISPEECH('.',url='train-clean-100', download=True)
+val_dataset = torchaudio.datasets.LIBRISPEECH('.',url='dev-clean', download=True)
+test_dataset = torchaudio.datasets.LIBRISPEECH('.',url='test-clean', download=True)
