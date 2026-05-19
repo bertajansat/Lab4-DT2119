@@ -31,7 +31,7 @@ hparams = {
 	"dropout": 0.1,
 	"learning_rate": 5e-4, 
 	"batch_size": 64, 
-	"epochs": 15
+	"epochs": 1
 }
 
 
@@ -142,6 +142,7 @@ class SpeechRecognitionModel(nn.Module):
 '''
 ACCURACY MEASURES
 '''
+
 def wer(reference, hypothesis, ignore_case=False, delimiter=' '):
 	if ignore_case == True:
 		reference = reference.lower()
@@ -185,58 +186,64 @@ TRAINING AND TESTING
 '''
 
 def train(model, device, train_loader, criterion, optimizer, epoch):
-	model.train()
-	data_len = len(train_loader.dataset)
-	for batch_idx, _data in enumerate(train_loader):
-		spectrograms, labels, input_lengths, label_lengths = _data 
-		spectrograms, labels = spectrograms.to(device), labels.to(device)
-
-		optimizer.zero_grad()
-		# model output is (batch, time, n_class)
-		output = model(spectrograms)  
-		# transpose to (time, batch, n_class) in loss function
-		loss = criterion(output.transpose(0, 1), labels, input_lengths, label_lengths)
-		loss.backward()
-		optimizer.step()
-		if batch_idx % 100 == 0 or batch_idx == data_len:
-			print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-				epoch, batch_idx * len(spectrograms), data_len,
-				100. * batch_idx / len(train_loader), loss.item()))
+    model.train()
+    data_len = len(train_loader.dataset)
+    for batch_idx, _data in enumerate(train_loader):
+        spectrograms, labels, input_lengths, label_lengths = _data
+        spectrograms = spectrograms.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+    
+        optimizer.zero_grad()
+    
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            output = model(spectrograms)
+    
+        # CTC stays in fp32 precision for stability
+        loss = criterion(output.float().transpose(0, 1),
+                         labels, input_lengths, label_lengths)
+    
+        loss.backward()
+        optimizer.step()
+        if batch_idx % 100 == 0 or batch_idx == data_len:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(spectrograms), data_len,
+                100. * batch_idx / len(train_loader), loss.item()))
 
 def test(model, device, test_loader, criterion, epoch):
-	print('\nevaluating…')
-	model.eval()
-	test_loss = 0
-	test_cer, test_wer = [], []
-	with torch.no_grad():
-		for I, _data in enumerate(test_loader):
-			spectrograms, labels, input_lengths, label_lengths = _data 
-			spectrograms, labels = spectrograms.to(device), labels.to(device)
-
-			# model output is (batch, time, n_class)
-			output = model(spectrograms)  
-			# transpose to (time, batch, n_class) in loss function
-			loss = criterion(output.transpose(0, 1), labels, input_lengths, label_lengths)
-			test_loss += loss.item() / len(test_loader)
-
-			# get target text
-			decoded_targets = []
-			for i in range(len(labels)):
-				decoded_targets.append(intToStr(labels[i][:label_lengths[i]].tolist()))
-
-			# get predicted text
-			decoded_preds = greedyDecoder(output)
-			# decoded_preds = languageDecoder(output)	# use only this line for beam search decoder
-
-			# calculate accuracy
-			for j in range(len(decoded_preds)):
-				test_cer.append(cer(decoded_targets[j], decoded_preds[j]))
-				test_wer.append(wer(decoded_targets[j], decoded_preds[j]))
-
-	avg_cer = sum(test_cer)/len(test_cer)
-	avg_wer = sum(test_wer)/len(test_wer)
-	print('Test set: Average loss: {:.4f}, Average CER: {:4f} Average WER: {:.4f}\n'.format(test_loss, avg_cer, avg_wer))
-	return avg_cer, avg_wer
+    print('\nevaluating…')
+    model.eval()
+    test_loss = 0
+    test_cer, test_wer = [], []
+    with torch.no_grad():
+        for I, _data in enumerate(test_loader):
+            spectrograms, labels, input_lengths, label_lengths = _data 
+            spectrograms, labels = spectrograms.to(device), labels.to(device)
+    
+            # model output is (batch, time, n_class)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = model(spectrograms)  
+            # transpose to (time, batch, n_class) in loss function
+            loss = criterion(output.float().transpose(0, 1), labels, input_lengths, label_lengths)
+            test_loss += loss.item() / len(test_loader)
+    
+            # get target text
+            decoded_targets = []
+            for i in range(len(labels)):
+                decoded_targets.append(intToStr(labels[i][:label_lengths[i]].tolist()))
+    
+            # get predicted text
+            decoded_preds = greedyDecoder(output)
+            # decoded_preds = languageDecoder(output)	# use only this line for beam search decoder
+    
+            # calculate accuracy
+            for j in range(len(decoded_preds)):
+                test_cer.append(cer(decoded_targets[j], decoded_preds[j]))
+                test_wer.append(wer(decoded_targets[j], decoded_preds[j]))
+    
+    avg_cer = sum(test_cer)/len(test_cer)
+    avg_wer = sum(test_wer)/len(test_wer)
+    print('Test set: Average loss: {:.4f}, Average CER: {:4f} Average WER: {:.4f}\n'.format(test_loss, avg_cer, avg_wer))
+    return avg_cer, avg_wer
 
 
 def gridSearch(model, device, val_loader, alphas, betas, kenlm_path='wiki-interpolate.3gram.arpa'):
@@ -285,92 +292,99 @@ def gridSearch(model, device, val_loader, alphas, betas, kenlm_path='wiki-interp
 MAIN PROGRAM
 '''
 if __name__ == '__main__':
-	argparser = argparse.ArgumentParser()
-	argparser.add_argument('--mode', help='train, test or recognize')
-	argparser.add_argument('--model', type=str, help='model to load', default='')
-	argparser.add_argument('wavfiles', nargs='*',help='wavfiles to recognize')
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument('--mode', help='train, test or recognize')
+    argparser.add_argument('--model', type=str, help='model to load', default='')
+    argparser.add_argument('wavfiles', nargs='*',help='wavfiles to recognize')
+    
+    args = argparser.parse_args()
+    
+    use_cuda = torch.cuda.is_available()
+    torch.manual_seed(7)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+    device = torch.device("cuda" if use_cuda else "cpu")
+    
+    train_dataset = torchaudio.datasets.LIBRISPEECH(".", url='train-clean-100', download=True)
+    val_dataset = torchaudio.datasets.LIBRISPEECH(".", url='dev-clean', download=True)
+    test_dataset = torchaudio.datasets.LIBRISPEECH(".", url='test-clean', download=True)
 
-	args = argparser.parse_args()
-
-	use_cuda = torch.cuda.is_available()
-	torch.manual_seed(7)
-	device = torch.device("cuda" if use_cuda else "cpu")
-
-	train_dataset = torchaudio.datasets.LIBRISPEECH(".", url='train-clean-100', download=True)
-	val_dataset = torchaudio.datasets.LIBRISPEECH(".", url='dev-clean', download=True)
-	test_dataset = torchaudio.datasets.LIBRISPEECH(".", url='test-clean', download=True)
-
-	kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
-	train_loader = data.DataLoader(dataset=train_dataset,
-					batch_size=hparams['batch_size'],
-					shuffle=True,
-					collate_fn=lambda x: dataProcessing(x, train_audio_transform),
-					**kwargs)
-
-	val_loader = data.DataLoader(dataset=val_dataset,
-					batch_size=hparams['batch_size'],
-					shuffle=True,
-					collate_fn=lambda x: dataProcessing(x, test_audio_transform),
-					**kwargs)
-
-	test_loader = data.DataLoader(dataset=test_dataset,
-					batch_size=hparams['batch_size'],
-					shuffle=False,
-					collate_fn=lambda x: dataProcessing(x, test_audio_transform),
-					**kwargs)
-
-	model = SpeechRecognitionModel(
-		hparams['n_cnn_layers'], 
-		hparams['n_rnn_layers'], 
-		hparams['rnn_dim'],
-		hparams['n_class'], 
-		hparams['n_feats'], 
-		hparams['stride'], 
-		hparams['dropout']
-		).to(device)
-
-	print(model)
-	print('Num Model Parameters', sum([param.nelement() for param in model.parameters()]))
-
-	optimizer = optim.AdamW(model.parameters(), hparams['learning_rate'])
-	criterion = nn.CTCLoss(blank=28).to(device)
-	
-	print(args.mode)
-
-	if args.model != '':
-		model.load_state_dict(torch.load(args.model))
-
-	if args.mode == 'train':
-		# keep track whether CER and WER improved compared to previous epoch
-		# -> if yes, overwrite checkpoint file
-		os.makedirs('checkpoints', exist_ok=True)
-		best_cer = float('inf')
-		best_wer = float('inf')
-		for epoch in range(hparams['epochs']):
-			train(model, device, train_loader, criterion, optimizer, epoch)
-			avg_cer, avg_wer = test(model, device, val_loader, criterion, epoch)
-
-			if avg_cer < best_cer and avg_wer < best_wer:
-				best_cer, best_wer = avg_cer, avg_wer
-				torch.save(model.state_dict(), 'checkpoints/best_model.pt')
-				print(f'Epoch {epoch}: new best (CER {avg_cer:.4f}, WER {avg_wer:.4f}) — checkpoint saved.')
-			else:
-				print(f'Epoch {epoch}: no improvement on both metrics (CER {avg_cer:.4f}, WER {avg_wer:.4f}) — checkpoint not updated.')
-
-	elif args.mode == 'test':
-		test(model, device, test_loader, criterion, -1)
-
-		# # grid seach part to determine LM weights (LM probs and word penalty)
-		# alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
-		# betas  = [0.0, 0.25, 0.5, 0.75, 1.0]
-		# best, _ = gridSearch(model, device, val_loader, alphas, betas)
-
-	elif args.mode == 'recognize':
-		for wavfile in args.wavfiles:
-			waveform, sample_rate = torchaudio.load(wavfile, normalize=True)
-			spectrogram = test_audio_transform(waveform)
-			input = torch.unsqueeze(spectrogram,dim=0).to(device)
-			output = model(input)
-			text = greedyDecoder(output)
-			print('wavfile:',wavfile)
-			print('text:',text)
+    kwargs = {
+        'num_workers': 4,           # 8 if your machine has plenty of cores
+        'pin_memory': True,
+        'persistent_workers': True, # don't tear down workers between epochs
+        'prefetch_factor': 2,       # default, but explicit is nice
+    } if use_cuda else {}
+    train_loader = data.DataLoader(dataset=train_dataset,
+                    batch_size=hparams['batch_size'],
+                    shuffle=True,
+                    collate_fn=lambda x: dataProcessing(x, train_audio_transform),
+                    **kwargs)
+    
+    val_loader = data.DataLoader(dataset=val_dataset,
+                    batch_size=hparams['batch_size'],
+                    shuffle=True,
+                    collate_fn=lambda x: dataProcessing(x, test_audio_transform),
+                    **kwargs)
+    
+    test_loader = data.DataLoader(dataset=test_dataset,
+                    batch_size=hparams['batch_size'],
+                    shuffle=False,
+                    collate_fn=lambda x: dataProcessing(x, test_audio_transform),
+                    **kwargs)
+    
+    model = SpeechRecognitionModel(
+        hparams['n_cnn_layers'], 
+        hparams['n_rnn_layers'], 
+        hparams['rnn_dim'],
+        hparams['n_class'], 
+        hparams['n_feats'], 
+        hparams['stride'], 
+        hparams['dropout']
+        ).to(device)
+    
+    print(model)
+    print('Num Model Parameters', sum([param.nelement() for param in model.parameters()]))
+    
+    optimizer = optim.AdamW(model.parameters(), hparams['learning_rate'])
+    criterion = nn.CTCLoss(blank=28).to(device)
+    
+    print(args.mode)
+    
+    if args.model != '':
+        model.load_state_dict(torch.load(args.model))
+    
+    if args.mode == 'train':
+        # keep track whether CER and WER improved compared to previous epoch
+        # -> if yes, overwrite checkpoint file
+        os.makedirs('checkpoints', exist_ok=True)
+        best_cer = float('inf')
+        best_wer = float('inf')
+        for epoch in range(hparams['epochs']):
+            train(model, device, train_loader, criterion, optimizer, epoch)
+            avg_cer, avg_wer = test(model, device, val_loader, criterion, epoch)
+    
+            if avg_wer < best_wer:
+                best_cer, best_wer = avg_cer, avg_wer
+                torch.save(model.state_dict(), 'checkpoints/best_model.pt')
+                print(f'Epoch {epoch}: new best (CER {avg_cer:.4f}, WER {avg_wer:.4f}) — checkpoint saved.')
+            else:
+                print(f'Epoch {epoch}: no improvement on both metrics (CER {avg_cer:.4f}, WER {avg_wer:.4f}) — checkpoint not updated.')
+    
+    elif args.mode == 'test':
+        test(model, device, test_loader, criterion, -1)
+    
+        # # grid seach part to determine LM weights (LM probs and word penalty)
+        # alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+        # betas  = [0.0, 0.25, 0.5, 0.75, 1.0]
+        # best, _ = gridSearch(model, device, val_loader, alphas, betas)
+    
+    elif args.mode == 'recognize':
+        for wavfile in args.wavfiles:
+            waveform, sample_rate = torchaudio.load(wavfile, normalize=True)
+            spectrogram = test_audio_transform(waveform)
+            input = torch.unsqueeze(spectrogram,dim=0).to(device)
+            output = model(input)
+            text = greedyDecoder(output)
+            print('wavfile:',wavfile)
+            print('text:',text)
